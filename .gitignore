@@ -18,5 +18,13 @@ dist/
 .DS_Store
 Thumbs.db
 
+# Secrets
+credentials.json
+*.pem
+*.key
+
 # Docker
 docker-compose.override.yaml
+
+# Lock files (regenerated)
+uv.lock

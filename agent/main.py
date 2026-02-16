@@ -1,67 +1,276 @@
 import json
+import os
+import asyncio
+from datetime import datetime
 
 from dotenv import load_dotenv
 
 from livekit import agents, api, rtc
-from livekit.agents import AgentServer, AgentSession, room_io
+from livekit.agents import AgentServer, AgentSession, room_io, AutoSubscribe
 from livekit.plugins import cartesia, deepgram, google, noise_cancellation, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
+import agent_tools
+from agent_tools import (
+    load_properties_once,
+    set_cached_context,
+    flush_cached_context,
+    clear_cached_context,
+    get_cached_context,
+)
 from assistant import TrulivAssistant
-from config import AGENT_NAME, SIP_TRUNK_OUTBOUND_ID
-from prompts import INBOUND_GREETING
+from database import get_async_context_collection
+from lead_sync import sync_user_to_leadsquared
+from logger import logger
 
 load_dotenv(".env.local")
+
+AGENT_NAME = os.getenv("AGENT_NAME", "truliv-telephony-agent")
+SIP_TRUNK_OUTBOUND_ID = os.getenv("SIP_TRUNK_OUTBOUND_ID", "")
+
 
 server = AgentServer()
 
 
+# ── Helpers ─────────────────────────────────────────────────────────
+
+
+def _extract_phone_from_participant(participant: rtc.RemoteParticipant) -> str:
+    """Extract phone number from a SIP participant's attributes or identity."""
+    phone = participant.attributes.get("sip.phoneNumber", "")
+    if not phone:
+        phone = participant.identity or ""
+    return phone.lstrip("+").strip()
+
+
+def _normalize_user_id(phone: str) -> str:
+    """Normalize phone number to user_id format (91XXXXXXXXXX)."""
+    clean = phone.lstrip("+").strip()
+    if clean.startswith("91") and len(clean) > 10:
+        return clean
+    if len(clean) == 10 and clean.isdigit():
+        return f"91{clean}"
+    return clean
+
+
+def _build_greeting_instructions(user_contexts: dict) -> str:
+    """Build dynamic greeting instructions based on returning customer context."""
+    name = user_contexts.get("name", "")
+    is_returning = name and name not in ["Voice User", "User", "Unknown", ""]
+    bot_location = user_contexts.get("botLocationPreference", "")
+    bot_sv_date = user_contexts.get("botSvDate", "")
+
+    if is_returning and name:
+        first_name = name.split()[0]
+        if bot_sv_date:
+            return (
+                f"Greet the caller by name '{first_name}'. "
+                f"They have a visit scheduled on {bot_sv_date}. "
+                f"Ask if they completed the visit or need to reschedule."
+            )
+        if bot_location:
+            return (
+                f"Greet the caller by name '{first_name}'. "
+                f"They were interested in properties near {bot_location}. "
+                f"Ask if they visited or need more help."
+            )
+        return (
+            f"Greet the returning caller by name '{first_name}'. "
+            f"Ask how you can help them today."
+        )
+
+    return (
+        "Greet the caller warmly. Introduce yourself as Priya from Truliv Coliving. "
+        "Ask if they are looking for a PG in Chennai."
+    )
+
+
+# ── Main Agent Entry Point ──────────────────────────────────────────
+
+
 @server.rtc_session(agent_name=AGENT_NAME)
 async def truliv_agent(ctx: agents.JobContext):
-    # Check if this is an outbound call by reading metadata
+    """Truliv voice agent — handles both inbound and outbound SIP calls."""
+
     phone_number = None
+    is_outbound = False
+
+    # ── 1. Determine call type (outbound vs inbound) ────────────────
     if ctx.job.metadata:
         try:
             metadata = json.loads(ctx.job.metadata)
             phone_number = metadata.get("phone_number")
-        except json.JSONDecodeError:
+            if phone_number:
+                is_outbound = True
+        except (json.JSONDecodeError, TypeError):
             pass
 
-    # If outbound, place the SIP call
-    if phone_number:
-        sip_participant_identity = phone_number
+    # ── 2. Handle outbound SIP dial ─────────────────────────────────
+    if is_outbound and phone_number:
         try:
             await ctx.api.sip.create_sip_participant(
                 api.CreateSIPParticipantRequest(
                     room_name=ctx.room.name,
                     sip_trunk_id=SIP_TRUNK_OUTBOUND_ID,
                     sip_call_to=phone_number,
-                    participant_identity=sip_participant_identity,
+                    participant_identity=phone_number,
                     wait_until_answered=True,
                 )
             )
-            print(f"Outbound call to {phone_number} answered successfully")
+            logger.info(f"Outbound call to {phone_number} answered")
         except api.TwirpError as e:
-            print(
-                f"Error creating SIP participant: {e.message}, "
-                f"SIP status: {e.metadata.get('sip_status_code')} "
+            logger.error(
+                f"SIP dial error: {e.message}, "
+                f"status: {e.metadata.get('sip_status_code')} "
                 f"{e.metadata.get('sip_status')}"
             )
             ctx.shutdown()
             return
 
-    # Create the agent session with STT-LLM-TTS pipeline
+    # ── 3. For inbound, extract caller phone from SIP participant ───
+    if not is_outbound:
+        await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
+        participant = await ctx.wait_for_participant()
+        phone_number = _extract_phone_from_participant(participant)
+        logger.info(f"Inbound call from: {phone_number}")
+
+    # ── 4. Derive user IDs ──────────────────────────────────────────
+    user_id = _normalize_user_id(phone_number or "unknown")
+    voice_user_id = user_id
+    logger.info(f"Session started: user_id={user_id}")
+
+    # ── 5. Load user context from MongoDB ───────────────────────────
+    user_contexts = {}
+    try:
+        context_collection = await get_async_context_collection()
+        user_doc = await context_collection.find_one({"_id": user_id})
+
+        if user_doc:
+            user_contexts = user_doc.get("context_data", {})
+            logger.info(f"Loaded existing context for {user_id}")
+        else:
+            user_contexts = {
+                "phoneNumber": phone_number or "",
+                "name": "Voice User",
+            }
+            await context_collection.update_one(
+                {"_id": user_id},
+                {"$set": {"context_data": user_contexts}},
+                upsert=True,
+            )
+            logger.info(f"Created new user context for {user_id}")
+    except Exception as e:
+        logger.error(f"MongoDB context load failed: {e}")
+        user_contexts = {"phoneNumber": phone_number or "", "name": "Voice User"}
+
+    # Cache context in-memory for tool access during the call
+    set_cached_context(voice_user_id, user_contexts)
+
+    # ── 6. Load property data (cached globally after first call) ────
+    properties_name = []
+    try:
+        await load_properties_once()
+        if agent_tools.properties_data_cache:
+            properties_name = [
+                p.get("name", "")
+                for p in agent_tools.properties_data_cache
+                if p.get("name")
+            ]
+            logger.info(f"Loaded {len(properties_name)} property names")
+    except Exception as e:
+        logger.error(f"Failed to load properties: {e}")
+
+    # ── 7. Create the assistant with user context ───────────────────
+    assistant = TrulivAssistant(
+        voice_user_id=voice_user_id,
+        user_id=user_id,
+        user_contexts=user_contexts,
+        properties_name=properties_name,
+    )
+
+    # ── 8. Build STT with keyword boosting ──────────────────────────
+    keywords = list(properties_name)
+    keywords.extend([
+        "OMR", "Velachery", "Kodambakkam", "T Nagar", "Anna Nagar",
+        "Adyar", "Guindy", "Porur", "Sholinganallur", "Thoraipakkam",
+        "Perungudi", "Tambaram", "Chrompet", "Pallavaram", "Truliv",
+        "Mylapore", "Nungambakkam", "Kilpauk", "Egmore", "Saidapet",
+    ])
+    stt = deepgram.STT(model="nova-3", language="en", keywords=keywords)
+
+    # ── 9. Create agent session ─────────────────────────────────────
     session = AgentSession(
-        stt=deepgram.STT(model="nova-3", language="en"),
+        stt=stt,
         llm=google.LLM(model="gemini-2.5-flash"),
         tts=cartesia.TTS(model="sonic", language="en"),
         vad=silero.VAD.load(),
         turn_detection=MultilingualModel(),
     )
 
+    # ── 10. Register post-call cleanup ──────────────────────────────
+    @session.on("close")
+    async def on_session_close():
+        logger.info(f"Session closing for {user_id}")
+        try:
+            # Snapshot cached context before flush (flush clears the cache)
+            cached_ctx = get_cached_context(voice_user_id) or user_contexts
+
+            # Generate call summary from conversation history
+            summary = ""
+            try:
+                chat = session.chat_ctx
+                if chat and hasattr(chat, "items"):
+                    msgs = []
+                    for item in chat.items:
+                        text = getattr(item, "text_content", None) or ""
+                        if text:
+                            role = getattr(item, "role", "unknown")
+                            msgs.append(f"{role}: {text}")
+                    if msgs:
+                        summary = " | ".join(msgs[-8:])[:500]
+            except Exception as e:
+                logger.error(f"Summary generation failed: {e}")
+
+            # Save call history entry to MongoDB
+            if summary:
+                now = datetime.now()
+                call_entry = {
+                    "date": now.strftime("%Y-%m-%d"),
+                    "time": now.strftime("%I:%M %p"),
+                    "summary": summary,
+                    "visitScheduled": bool(cached_ctx.get("botSvDate")),
+                }
+                try:
+                    ctx_coll = await get_async_context_collection()
+                    await ctx_coll.update_one(
+                        {"_id": user_id},
+                        {
+                            "$push": {"context_data.callHistory": call_entry},
+                            "$set": {"context_data.lastCallSummary": summary},
+                        },
+                    )
+                    logger.info(f"Saved call summary for {user_id}")
+                except Exception as e:
+                    logger.error(f"Failed to save call history: {e}")
+
+            # Flush pending context updates to MongoDB
+            await flush_cached_context(voice_user_id)
+
+            # Sync to LeadSquared CRM
+            try:
+                await sync_user_to_leadsquared(user_id, cached_ctx)
+            except Exception as e:
+                logger.error(f"LeadSquared sync error: {e}")
+
+        except Exception as e:
+            logger.error(f"Session cleanup error for {user_id}: {e}")
+        finally:
+            clear_cached_context(voice_user_id)
+
+    # ── 11. Start the session ───────────────────────────────────────
     await session.start(
         room=ctx.room,
-        agent=TrulivAssistant(),
+        agent=assistant,
         room_options=room_io.RoomOptions(
             audio_input=room_io.AudioInputOptions(
                 noise_cancellation=lambda params: (
@@ -73,9 +282,10 @@ async def truliv_agent(ctx: agents.JobContext):
         ),
     )
 
-    # For inbound calls, greet the caller. For outbound, wait for the person to speak first.
-    if phone_number is None:
-        await session.generate_reply(instructions=INBOUND_GREETING)
+    # ── 12. Greeting (inbound only — outbound waits for recipient) ──
+    if not is_outbound:
+        greeting = _build_greeting_instructions(user_contexts)
+        await session.generate_reply(instructions=greeting)
 
 
 if __name__ == "__main__":

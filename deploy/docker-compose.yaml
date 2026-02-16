@@ -56,17 +56,27 @@ services:
     depends_on:
       - livekit
     environment:
+      # LiveKit
       - LIVEKIT_URL=ws://localhost:7880
       - LIVEKIT_API_KEY=${LIVEKIT_API_KEY}
       - LIVEKIT_API_SECRET=${LIVEKIT_API_SECRET}
+      # AI Services
       - DEEPGRAM_API_KEY=${DEEPGRAM_API_KEY}
       - GOOGLE_API_KEY=${GOOGLE_API_KEY}
       - CARTESIA_API_KEY=${CARTESIA_API_KEY}
-      - GOOGLE_MAPS_API_KEY=${GOOGLE_MAPS_API_KEY}
-      - TRULIV_API_BASE_URL=${TRULIV_API_BASE_URL}
-      - TRULIV_API_KEY=${TRULIV_API_KEY}
+      # Warden API (Truliv property management)
+      - WARDEN_API_BASE_URL=${WARDEN_API_BASE_URL}
+      - WARDEN_API_KEY=${WARDEN_API_KEY}
+      # MongoDB
+      - MONGODB_CONNECTION_STRING=${MONGODB_CONNECTION_STRING}
+      # Google Sheets service account credentials (JSON string)
+      - GOOGLE_SERVICE_CRED=${GOOGLE_SERVICE_CRED}
+      # LeadSquared CRM
+      - LEADSQUARED_ACCESS_KEY=${LEADSQUARED_ACCESS_KEY}
+      - LEADSQUARED_SECRET_KEY=${LEADSQUARED_SECRET_KEY}
+      # SIP / Agent
       - SIP_TRUNK_OUTBOUND_ID=${SIP_TRUNK_OUTBOUND_ID}
-      - HUMAN_TRANSFER_NUMBER=${HUMAN_TRANSFER_NUMBER}
+      - AGENT_NAME=${AGENT_NAME:-truliv-telephony-agent}
     restart: unless-stopped
 
 volumes:

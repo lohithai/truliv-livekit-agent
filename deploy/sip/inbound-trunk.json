@@ -1,0 +1,9 @@
+{
+    "trunk": {
+        "name": "Truliv Inbound SIP Trunk",
+        "allowed_addresses": [],
+        "allowed_numbers": [],
+        "auth_username": "",
+        "auth_password": ""
+    }
+}

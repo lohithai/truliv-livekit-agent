@@ -6,9 +6,8 @@ from datetime import datetime
 from dotenv import load_dotenv
 
 from livekit import agents, api, rtc
-from livekit.agents import AgentServer, AgentSession, room_io, AutoSubscribe
-from livekit.plugins import cartesia, deepgram, google, noise_cancellation, silero
-from livekit.plugins.turn_detector.multilingual import MultilingualModel
+from livekit.agents import AgentServer, AgentSession, AutoSubscribe
+from livekit.plugins import deepgram, google, sarvam, silero
 
 import agent_tools
 from agent_tools import (
@@ -196,32 +195,41 @@ async def truliv_agent(ctx: agents.JobContext):
         "Perungudi", "Tambaram", "Chrompet", "Pallavaram", "Truliv",
         "Mylapore", "Nungambakkam", "Kilpauk", "Egmore", "Saidapet",
     ])
-    stt = deepgram.STT(model="nova-3", language="en", keywords=keywords)
+    stt = deepgram.STT(model="nova-2", language="multi", keyterm=keywords)
 
     # ── 9. Create agent session ─────────────────────────────────────
     session = AgentSession(
         stt=stt,
         llm=google.LLM(model="gemini-2.5-flash"),
-        tts=cartesia.TTS(model="sonic", language="en"),
-        vad=silero.VAD.load(),
-        turn_detection=MultilingualModel(),
+        tts=sarvam.TTS(
+            model="bulbul:v3",
+            target_language_code="hi-IN",
+            speaker="ritu",
+        ),
+        vad=silero.VAD.load(
+            min_speech_duration=0.05,       # 50ms — catch short words like "hello", "haan"
+            min_silence_duration=0.3,       # 300ms — fast end-of-speech detection
+            prefix_padding_duration=0.5,    # 500ms — don't clip start of speech
+            activation_threshold=0.25,      # Very sensitive — telephony audio can be quiet
+            sample_rate=16000,
+        ),
+        min_endpointing_delay=0.2,          # 200ms — respond quickly after user stops
+        max_endpointing_delay=1.0,          # 1s max wait — don't hang on pauses
+        preemptive_generation=True,         # Start LLM while user is finishing last word
     )
 
     # ── 10. Register post-call cleanup ──────────────────────────────
-    @session.on("close")
-    async def on_session_close():
+    async def _cleanup():
         logger.info(f"Session closing for {user_id}")
         try:
-            # Snapshot cached context before flush (flush clears the cache)
             cached_ctx = get_cached_context(voice_user_id) or user_contexts
 
-            # Generate call summary from conversation history
             summary = ""
             try:
-                chat = session.chat_ctx
-                if chat and hasattr(chat, "items"):
+                history = session.history
+                if history and hasattr(history, "items"):
                     msgs = []
-                    for item in chat.items:
+                    for item in history.items:
                         text = getattr(item, "text_content", None) or ""
                         if text:
                             role = getattr(item, "role", "unknown")
@@ -231,7 +239,6 @@ async def truliv_agent(ctx: agents.JobContext):
             except Exception as e:
                 logger.error(f"Summary generation failed: {e}")
 
-            # Save call history entry to MongoDB
             if summary:
                 now = datetime.now()
                 call_entry = {
@@ -253,10 +260,8 @@ async def truliv_agent(ctx: agents.JobContext):
                 except Exception as e:
                     logger.error(f"Failed to save call history: {e}")
 
-            # Flush pending context updates to MongoDB
             await flush_cached_context(voice_user_id)
 
-            # Sync to LeadSquared CRM
             try:
                 await sync_user_to_leadsquared(user_id, cached_ctx)
             except Exception as e:
@@ -264,22 +269,16 @@ async def truliv_agent(ctx: agents.JobContext):
 
         except Exception as e:
             logger.error(f"Session cleanup error for {user_id}: {e}")
-        finally:
-            clear_cached_context(voice_user_id)
+
+    @session.on("close")
+    def on_session_close():
+        asyncio.create_task(_cleanup())
+        clear_cached_context(voice_user_id)
 
     # ── 11. Start the session ───────────────────────────────────────
     await session.start(
         room=ctx.room,
         agent=assistant,
-        room_options=room_io.RoomOptions(
-            audio_input=room_io.AudioInputOptions(
-                noise_cancellation=lambda params: (
-                    noise_cancellation.BVCTelephony()
-                    if params.participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP
-                    else noise_cancellation.BVC()
-                ),
-            ),
-        ),
     )
 
     # ── 12. Greeting (inbound only — outbound waits for recipient) ──

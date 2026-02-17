@@ -33,6 +33,18 @@ import calendar
 class TrulivAssistant(Agent):
     """Truliv Voice AI Agent for LiveKit - handles PG property inquiries and visit scheduling."""
 
+    LANGUAGE_MAP = {
+        "en": {"tts_code": "en-IN", "name": "English"},
+        "hi": {"tts_code": "hi-IN", "name": "Hindi"},
+        "ta": {"tts_code": "ta-IN", "name": "Tamil"},
+        "te": {"tts_code": "te-IN", "name": "Telugu"},
+        "kn": {"tts_code": "kn-IN", "name": "Kannada"},
+        "bn": {"tts_code": "bn-IN", "name": "Bengali"},
+        "gu": {"tts_code": "gu-IN", "name": "Gujarati"},
+        "ml": {"tts_code": "ml-IN", "name": "Malayalam"},
+        "mr": {"tts_code": "mr-IN", "name": "Marathi"},
+    }
+
     def __init__(
         self,
         voice_user_id: str,
@@ -44,22 +56,11 @@ class TrulivAssistant(Agent):
         self.user_id = user_id
         self.user_contexts = user_contexts
         self.properties_name = properties_name or []
+        self.current_language = "hi"
 
         instruction = self._compose_system_prompt()
         super().__init__(
             instructions=instruction,
-            tools=[
-                self.voice_update_user_profile,
-                self.voice_find_nearest_property,
-                self.voice_properties_according_to_budget,
-                self.voice_query_property_information,
-                self.voice_explore_more_properties,
-                self.voice_schedule_site_visit,
-                self.voice_get_room_types,
-                self.voice_get_availability,
-                self.voice_get_all_room_availability,
-                self.voice_zero_deposit,
-            ],
         )
 
     def _compose_system_prompt(self) -> str:
@@ -127,6 +128,38 @@ class TrulivAssistant(Agent):
             last_call_summary=last_call_summary,
             call_history_text=call_history_text,
         )
+
+    # -- Language Switching (follows LiveKit official pattern) ----------------
+
+    async def _switch_language(self, language_code: str) -> str:
+        """Switch STT + TTS to the target language."""
+        if language_code == self.current_language:
+            return f"Already speaking {self.LANGUAGE_MAP[language_code]['name']}"
+
+        tts_code = self.LANGUAGE_MAP[language_code]["tts_code"]
+        lang_name = self.LANGUAGE_MAP[language_code]["name"]
+
+        if self.session.tts is not None:
+            self.session.tts.update_options(target_language_code=tts_code)
+
+        self.current_language = language_code
+        logger.info(f"Language switched to {lang_name} ({tts_code})")
+        return f"Switched to {lang_name}"
+
+    @function_tool()
+    async def switch_language(
+        self,
+        ctx: RunContext,
+        language: str,
+    ) -> str:
+        """Switch the conversation language when the caller speaks a different language than the current one. Only call this AFTER the caller has spoken — never on the greeting turn. Do NOT ask permission — just detect and switch.
+
+        Args:
+            language: Language code — one of: en (English), hi (Hindi), ta (Tamil), te (Telugu), kn (Kannada), bn (Bengali), gu (Gujarati), ml (Malayalam), mr (Marathi)
+        """
+        if language not in self.LANGUAGE_MAP:
+            return f"Unsupported language: {language}. Supported: {', '.join(self.LANGUAGE_MAP.keys())}"
+        return await self._switch_language(language)
 
     # -- Tool Methods ---------------------------------------------------------
 
